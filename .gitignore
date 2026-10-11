@@ -1,0 +1,5 @@
+build/
+outputs/
+*.nfs*
+fa25_ece564_Project2025_v3.1.pdf
+*.swp
