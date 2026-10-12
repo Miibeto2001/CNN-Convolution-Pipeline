@@ -1,16 +1,90 @@
+# CNN Convolution Pipeline (1024×1024 Input, 4×4 Kernel)
 
+ECE 464, Fall 2025 — NC State University
 
+A hardware 4×4 convolution engine that reads a 1024×1024 image and a 4×4 kernel from
+external DRAM, computes the convolution with a serialized signed multiply-accumulate
+datapath, and streams saturated 8-bit results back to DRAM using burst transactions. The
+controller is a multi-phase FSM that sequences kernel load, input-window buffering, MAC
+computation, and output writeback, reusing the same control flow for every window
+position across the full image.
 
-
-# Project 2025
-This document contains the instructions and commands to setup Homework 5 directory. This Homework make use of cmake build system to build and run the common command used eary in the course.
+Full write-up with results and the datapath/FSM diagrams: [`Project_report/report.pdf`](Project_report/report.pdf).
 
 ## Overview
+- [Design Summary](#design-summary)
+- [Interface](#interface)
+- [Memory Layout](#memory-layout)
+- [Results](#results)
 - [Decompress](#decompress)
 - [Start Designing](#start-designing)
 - [Synthesis](#synthesis)
-- [Submission](#submission)
 - [Appendix](#appendix)
+
+## Design Summary
+
+Convolution is computed by sliding the 4×4 kernel across the input and, at each position,
+computing:
+
+$$Y(i,j) = \sum_{m=0}^{3}\sum_{n=0}^{3} X(i+m,\, j+n) \cdot K(m,n)$$
+
+This implementation uses the fixed 4×4 kernel:
+
+$$K = \begin{bmatrix} 1 & 0 & -1 & 0 \\ 1 & 0 & -1 & 0 \\ 1 & 0 & -1 & 0 \\ 1 & 0 & -1 & 0 \end{bmatrix}$$
+
+The 1024×1024 input produces a 1021×1021 convolution output. Internally the accumulator
+uses 20-bit values to absorb overflow, and the final result is truncated (clamped) to a
+signed 8-bit value before being written back to DRAM.
+
+**Datapath.** The entire 4×4 kernel and the current 4×4 input window are held in
+locally buffered registers to avoid repeated DRAM accesses. A single signed MAC unit
+iterates through the sixteen kernel/input products sequentially, accumulating partial
+sums over multiple cycles per output pixel. This trades cycle count for a much smaller,
+simpler datapath than a fully parallel MAC array.
+
+**Controller (FSM).** After `start`, the FSM loads the kernel with two burst reads,
+then streams input tiles from DRAM two rows at a time to form the sliding 4×4 window.
+During computation it drives kernel/input values into the MAC datapath, storing partial
+sums across columns. Once a window's accumulation finishes, saturation logic clamps the
+result and a burst write commits it to DRAM. Row/column counters advance the same control
+flow across the entire image.
+
+## Interface
+
+The DUT talks to a DRAM-backed test fixture over a simple start/ready handshake plus a
+burst-oriented SDR memory bus (`CMD`, `Address`, tri-stated `DQ`).
+
+![Test fixture block diagram](docs/figures/figure2-test-fixture.png)
+
+The test fixture treats the synchronous rising edge of `ready` as end-of-test:
+
+![DUT/testbench handshake timing](docs/figures/figure3-handshake-timing.png)
+
+## Memory Layout
+
+DRAM is laid out as 64-bit (8-byte) little-endian words: the first 16 entries hold the
+4×4 kernel weights, followed by the input matrix in row-major order. Output is written
+back in row-major order; since the convolution output (1021×1021) isn't a multiple of 8,
+each output row is zero-padded to the next multiple of 8 bytes so every row starts at a
+modulo-8 address. For a 32×32 example input, that padding looks like:
+
+![Example matrix sizes / zero padding for the convolution-only (464) project](docs/figures/figure5-padding-464.png)
+
+The same scheme scales to the full-size matrices used here: 1021 output columns/rows pad
+out to 1024.
+
+## Results
+
+| Metric | Value |
+|---|---|
+| Clock period achieved | 6 ns |
+| Simulation total cycles (per test) | 78,937,758 |
+| Total cell count | 4,019 cells |
+| Total cell area | 6,659.044 µm² |
+| Setup slack | 0.0009 |
+| Hold slack | 0.0309 |
+
+---
 
 ## Decompress
 Once you have placed ```projectFall2025.tar.gz``` at desired directory. Launch a terminal at that directory and use the following command to tar.
@@ -22,7 +96,7 @@ You should find the unzipped project folder ```projectFall2025/```
 ## Start Designing
 ### Setup script
 
-```projectFall2025/setup.sh``` is to load Modelsim and Synopsys. You can use differnt version if you want, but this verison is the one that will be used ot test you design. 
+```projectFall2025/setup.sh``` is used to load Modelsim and Synopsys.
 
 To source the script:
 ```bash
@@ -31,19 +105,13 @@ source setup.sh
 ```
 This script also enables you to <kbd>Tab</kbd> complete ```make``` commands
 
-### Homework description
+### Where the design lives
 
-The document is located in ```projectFall2025/Project_specification/```
+```projectFall2025/srcs/rtl/dut.sv``` is the top-level RTL implementation, with ports
+already connected to the test fixture. The detailed directory layout is in the
+**Appendix** below.
 
-### Where to put your design
-
-A Verilog file ```projectFall2025/srcs/rtl/dut.sv``` is provided with all the ports already connected to the test fixture. The dut.sv is a stub to put your code in.
-The detailed rundown of the directory structure can be found in the **Appendix** of this document.
-
-
-### How to setup build environment
-To setup you build environment
-
+### How to set up the build environment
 ```bash
 cd projectFall2025
 source setup.sh
@@ -51,48 +119,35 @@ mkdir build
 cd build
 cmake .. --preset run
 ```
-You will see a message showing the default Unity ID.
-```
-  DC_CLOCK_PER="4.0"
-  TEST="-1"
-  UNITY_ID="jdoe12"
-  CLASS="ECE564"
-```
-Update the variables in the CMakePresets.json file using your preferred text editor. Edit line 11, 12 to set your Unity ID and CLASS ID.
-```
-        "UNITY_ID": "jdoe12", -> "UNITY_ID": "your_id",
-        "CLASS": "ECE564", -> "CLASS": "ECE464",
-```
-### How to compile your design
+
+### How to compile the design
 
 This project provides three main simulation targets:
 
-- **dut** — Build and run **your implementation**  
-  - Synthesizable RTL intended for final submission  
-  - Must meet interface timing and support pipelining  
+- **dut** — Build and run the implementation
+  - Synthesizable RTL
+  - Must meet interface timing and support pipelining
   - Use this target to verify functionality, latency, and protocol compliance
 
-- **golden** — Run the **reference SystemVerilog model**  
-  - **Not pipelined** and **not synthesizable**  
-  - Behavioral-only model used as a correctness oracle  
+- **golden** — Run the reference SystemVerilog model
+  - Not pipelined and not synthesizable
+  - Behavioral-only model used as a correctness oracle
 
-- **sram** — Run the **memory test suite**  
-  - Demonstrates expected behavior for back-to-back commands  
-  - Helps visualize correct response sequences and edge-case handling
+- **sram** — Run the memory test suite
+  - Demonstrates expected behavior for back-to-back commands
 ---
-
 
 ## How to run simulation targets
 
 ### Normal and Debug targets
-There are two input types normal and debug. Normal is the inputs that you will be graded on, debug is used to help you design your module.
+There are two input types: normal and debug. Normal is the input the design is graded on; debug is smaller and meant for iterating quickly.
 
-Configure for Normal input:1024x1024
+Configure for Normal input (1024x1024):
 ```
 cd projectFall2025/build
 cmake .. --preset run
 ```
-Configure for Debug input:32x32; it’s just for convenience and not a design requirement. 
+Configure for Debug input (32x32, for convenience, not a design requirement):
 ```
 cd projectFall2025/build
 cmake .. --preset debug
@@ -100,217 +155,127 @@ cmake .. --preset debug
 
 ### Run with Modelsim UI:
 ```bash
-make vsim-dut 
+make vsim-dut
 ```
-This buids `projectFall2025/srcs/rtl/dut.sv` and launches the testbench in ModelSim.
+This builds `projectFall2025/srcs/rtl/dut.sv` and launches the testbench in ModelSim.
 
-
-### Build your implementation (dut)
+### Build the implementation (dut)
 This command can be executed inside ModelSim.
 ```bash
-make vlog-dut 
+make vlog-dut
 ```
-The following command when executed in ModelSim, will reload, restart, and run all the test cases after you make changes to the dut file.
+The following command, executed in ModelSim, will reload, restart, and run all test cases after changes to the dut file.
 ```bash
 make vlog-dut; restart -f; run -all
 ```
 
-### Simulation 
-The simulation log file are here: 
+### Simulation
+The simulation log file:
 ```
 projectFall2025/build/sim/logs/result.log
-``` 
-The simulation output files are here 
+```
+The simulation output files:
 ```
 projectFall2025/build/sim/outputs/output[0/1/2/3].dat
-``` 
+```
 
-There is a do file that you can update for your design ```projectFall2025/do/waves.do``` 
+There is a do file for waveform setup: ```projectFall2025/do/waves.do```
 
-In Modelsim: This will add the waves in you design
+In Modelsim:
 ```
 do ../do/waves.do
 ```
 
 ### Run golden model with Modelsim UI
 ```bash
-make vsim-golden  
+make vsim-golden
 ```
-All other commands are the same as the your implementation (dut)
+All other commands are the same as for the implementation (dut).
 
 ### Run memory behavior tests with Modelsim UI
 ```bash
-make vsim-sram 
+make vsim-sram
 ```
-This is a short example demonstrating the memory behavior, in case you are not sure how to interact with the sram module. 
+Short example demonstrating the SRAM scratchpad's behavior.
 
-### Configuring for individual tests:
-The following command will configure `vlog-dut` to run only one of the test cases, `<test_case>` can be 0, 1, 2, 3, 4 or 5.
-In case your design only fails part of the test cases, this can be used to speed up the run.
+### Configuring for individual tests
 ```bash
 cmake .. --preset test<test_case>
-make vsim-dut  
+make vsim-dut
 ```
-An example configuring `vlog-dut` to run only test case 2 is shown as follows:
+`<test_case>` can be 0–5. Example, test case 2:
 ```bash
 cmake .. --preset test2
-make vsim-dut  
+make vsim-dut
 ```
 
-### Configuring for all tests:
-Setting `run` will configure `vlog-dut` to run all test cases.
+### Configuring for all tests
 ```bash
 cmake .. --preset run
-make vsim-dut   
+make vsim-dut
 ```
 
-### Configuring for individual debug:
-The following command will configure `vlog-dut` to run only one of the debug cases, `<test_case>` can be 0, 1, 2, or 3.
-In case your design only fails part of the test cases, this can be used to speed up the run.
+### Configuring for individual/all debug cases
 ```bash
-cmake .. --preset debug<test_case>
-make vsim-dut  
+cmake .. --preset debug<test_case>   # 0-3
+make vsim-dut
 ```
-An example configuring `vlog-dut` to run only test case 2 is shown as follows:
 ```bash
-cmake .. --preset debug2
-make vsim-dut  
+cmake .. --preset debug              # all debug cases
+make vsim-dut
 ```
 
-### Configuring for all debugs:
-Setting `debug` will configure `vlog-dut` to run all debug cases.
-```bash
+### Evaluation / headless testing
+```
+cd projectFall2025/build
 cmake .. --preset run
-make vsim-dut   
+make vsim-dut-c   # Runs the test in headless mode
 ```
-
-
-### Evaluation Testing
-To evaluate your design headless/no-gui, change directory to ```projectFall2025/build/```
+Produces a results log — run this as a final check before synthesis.
 ```
-cmake .. --preset run
-make vsim-dut-c # Runs the test in headless mode  
+projectFall2025/build/sim/logs/results.log
 ```
-This will produce a log file that will highlight the results of your design. This should only be ran as a final step before Synthesis
-
-Simulation log file is located here ```projectFall2025/build/sim/logs/results.log```
 
 ## Synthesis
 
-Once you have a functional design, you can synthesize it in ```projectFall2025/build/```
-
-### Synthesis Command
-The following command will synthesize your design with a default clock period of 10 ns
+From ```projectFall2025/build/```:
 ```bash
-make synth  
+make synth
 ```
-### Clock Period
-
-To run synthesis with a different clock period
+Default clock period is 10 ns. To synthesize at a different clock period:
 ```bash
 cmake .. -DDC_CLOCK_PER=YYY.XX
-make synth 
+make synth
 ```
-For example, the following command will set the target clock period to 4 ns.
-
+Example, 4 ns:
 ```bash
 cmake .. -DDC_CLOCK_PER=4.0
-make synth 
+make synth
 ```
 
-
-### Synthesis Reports
-You can find your timing report and area report in ```projectFall2025/build/synth/reports/```
-
-## Submission
-### Project Report
-
-Place your report file in ```projectFall2025/Project_report/```. Replace the report.pdf with your report
-
-Edit line ```13``` in ```projectFall2025/CMakePresets.json ``` to reflect the CLK_PER that you used to synthize your design. 
-```
-        "DC_CLOCK_PER": "10.0" -> "DC_CLOCK_PER": "4.0"
-```
-
-### Compress for submission
-
-To generate the tar.gz file for submission
-
-change directory to ```projectFall2025/build``` and use the following command
-
-```bash
-cmake .. --preset run
-make compress
-```
-Make sure the message reflects the your unity id and new clk and class type.
-```
-  DC_CLOCK_PER="10.0" ->  DC_CLOCK_PER="YYY.XXX"
-  TEST="-1"
-  UNITY_ID="jdoe12" -> UNITY_ID="your_id" 
-  "CLASS": "ECE564", -> "CLASS": "ECE464",
-```
-You will find the generated tar.gz file in ```projectFall2025/build/submission.your_id.tar.gz``` 
-
-### Check before you submit
-
-Please check your .tar.gz file and make sure all the files are present for submission
-
-The following files are need to be able to run your desing:
-```
-projectFall2025/srcs/rtl/dut.sv 
-projectFall2025/CMakePresets.json
-```
-
-Check to make sure you report is in the following dir:
-```
-projectFall2025/Project_report/*.pdf
-```
-
-Your design simulation will be evaluated by, 1st: downloading the tar, 2nd: running these commands:
-```bash
-cd projectFall2025
-cp ./path/to/tar/file/submission.jdoe12.tar.gz ./
-tar xzf submission.your_id.tar.gz // This command will update the files for your design
-mkdir build
-cd build
-cmake .. --preset run
-make vsim-dut-c synth
-```
-It's recommended to download a fresh copy of the projectFall2025 directory and run the command above. 
-
-### Submit your files
-Upload the generated ```projectFall2025/build/submission.your_id.tar.gz``` file to Moodle page
-
+Timing and area reports: ```projectFall2025/build/synth/reports/```
 
 ## Appendix
 
 ### Directory Rundown
 
-You will find the following directories in ```projectFall2025/```
-
 * ```projectFall2025/```
   * Contains the ```CMakeLists.txt``` used to compile and simulate the design
-* ```projectFall2025/inputs/input[0/1/2/3/4/5].dat``` 
-  * Contains the .dat files for the memory content for DRAM used in Project
-* ```projectFall2025/outputs/output[0/1/2/3/4/5].dat``` 
-  * Contains the .dat files for the output DRAM used in Project
+* ```projectFall2025/inputs/input[0/1/2/3/4/5].dat```
+  * `.dat` files for the DRAM input/kernel memory content
+* ```projectFall2025/outputs/output[0/1/2/3/4/5].dat``` (generated)
+  * `.dat` files for the output DRAM content
 * ```projectFall2025/srcs/rtl/```
-  * All .v and .sv files will be compiled when executing ```make vlog-dut``` in ```projectFall2025/build/```
-  * A template ```dut.sv``` that interfaces with the test fixture is provided
-* ```projectFall2025/srcs/tb/golden_dut.sv``` 
-  * Contains the reference behavior model for the Project
-  * Use this commands to build the golden model ```make vlog-golden``` in ```projectFall2025/build/```
+  * All `.v`/`.sv` files compiled by ```make vlog-dut``` in ```projectFall2025/build/```
+  * `dut.sv` is the top-level implementation
+* ```projectFall2025/srcs/tb/golden_dut.sv```
+  * Reference behavioral model; build with ```make vlog-golden```
 * ```projectFall2025/Project_report/```
-  * Replace projectFall2025/Project_report/report.pdf with your Project report here before running ```make compress``` command
-* ```projectFall2025/Project_specification/```
-  * Contains the Project specification document
+  * Full project report (datapath/FSM diagrams, results, discussion)
 * ```projectFall2025/synthesis/```
-  * The directory where the tcl scripts used to synthesize your design
-  * Only the CompileAnalyze.tcl will be include in the submission.<your_unity_id>.tar.gz
-  * Synthesis reports will be exported to ```projectFall2025/build/synth/reports/```
-  * Synthesis logs will be exported to ```projectFall2025/build/logs/reports/```
-  * Synthesized netlist will be generated to ```projectFall2025/build/synth/gl/```
+  * TCL scripts used to synthesize the design
+  * Synthesis reports: ```projectFall2025/build/synth/reports/```
+  * Synthesis logs: ```projectFall2025/build/logs/reports/```
+  * Synthesized netlist: ```projectFall2025/build/synth/gl/```
 * ```projectFall2025/srcs/tb/```
-  * Contains the test fixture of the Project
-
-
+  * Test fixture (testbench) for the project
