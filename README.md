@@ -1,7 +1,5 @@
 # CNN Convolution Pipeline (1024×1024 Input, 4×4 Kernel)
 
-ECE 464, Fall 2025 — NC State University
-
 A hardware 4×4 convolution engine that reads a 1024×1024 image and a 4×4 kernel from
 external DRAM, computes the convolution with a serialized signed multiply-accumulate
 datapath, and streams saturated 8-bit results back to DRAM using burst transactions. The
